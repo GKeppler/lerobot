@@ -15,18 +15,17 @@
 import numpy as np
 import time
 import zmq
-import threading
 import logging
 import torch
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 import rerun as rr
 from scipy.spatial.transform import Rotation, Slerp
-from numpy.linalg import pinv
+# from numpy.linalg import pinv # Not used
 
 from lerobot.common.robot_devices.control_configs import VRTeleoperateControlConfig
 from lerobot.common.robot_devices.control_utils import control_loop
-from lerobot.common.robot_devices.utils import busy_wait, safe_disconnect
+from lerobot.common.robot_devices.utils import safe_disconnect # busy_wait not used
 from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.utils.utils import log_say
 
@@ -36,8 +35,8 @@ ARM_TELEOP_STOP = 0
 ARM_TELEOP_CONT = 1
 ARM_HIGH_RESOLUTION = 0
 ARM_LOW_RESOLUTION = 1
-SCALE_FACTOR = 1000.0  # Convert mm to m
-BIMANUAL_VR_FREQ = 90  # Hz
+# SCALE_FACTOR = 1000.0  # Not used directly
+BIMANUAL_VR_FREQ = 90  # Hz, Not directly used in this script logic
 
 # Define the Oculus joints mapping
 OCULUS_JOINTS = {
@@ -50,19 +49,39 @@ OCULUS_JOINTS = {
 }
 
 
-# Filter for removing noise in the teleoperation
 class Filter:
     def __init__(self, state, comp_ratio=0.6):
+        # state is expected to be a 6D vector [pos_x, pos_y, pos_z, rot_rx, rot_ry, rot_rz]
+        # This class is problematic if used for joint angles unless the robot has exactly 6 joints
+        # and this specific filtering approach (treating first 3 as pos, next 3 as ori via Slerp) is intended.
+        if len(state) < 6:
+            raise ValueError(f"Filter expects at least a 6-element state, got {len(state)}")
         self.pos_state = state[:3]
-        self.ori_state = state[3:7]
+        self.ori_state = state[3:6] # Assuming state[3:6] is a rotation vector
         self.comp_ratio = comp_ratio
 
     def __call__(self, next_state):
-        self.pos_state = self.pos_state[:3] * self.comp_ratio + next_state[:3] * (1 - self.comp_ratio)
-        ori_interp = Slerp([0, 1], Rotation.from_rotvec(
-            np.stack([self.ori_state, next_state[3:6]], axis=0)),)
-        self.ori_state = ori_interp([1 - self.comp_ratio])[0].as_rotvec()
-        return np.concatenate([self.pos_state, self.ori_state])
+        if len(next_state) < 6:
+             # If next_state is not 6D, return it unfiltered or handle error
+            logging.warning(f"Filter called with state of length {len(next_state)}, expected >= 6. Returning unfiltered.")
+            return next_state
+            
+        filtered_pos = self.pos_state * self.comp_ratio + next_state[:3] * (1 - self.comp_ratio)
+        
+        # Slerp for orientation part (next_state[3:6] must be a rotation vector)
+        slerp_rotations = Rotation.from_rotvec(np.stack([self.ori_state, next_state[3:6]], axis=0))
+        ori_interp = Slerp([0, 1], slerp_rotations)
+        filtered_ori_rotvec = ori_interp([1 - self.comp_ratio])[0].as_rotvec()
+        
+        self.pos_state = filtered_pos
+        self.ori_state = filtered_ori_rotvec
+        
+        # Reconstruct the full state vector
+        # If original state had more than 6 elements, append the rest unfiltered
+        filtered_state = np.concatenate([filtered_pos, filtered_ori_rotvec])
+        if len(next_state) > 6:
+            filtered_state = np.concatenate([filtered_state, next_state[6:]])
+        return filtered_state
 
 
 class ZMQKeypointPuller:
@@ -70,15 +89,16 @@ class ZMQKeypointPuller:
     def __init__(self, port, max_retries=3, data_timeout=1.0):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PULL)
+        # Set a High Water Mark to prevent excessive buffering if the consumer (this script) is slow.
+        # This means the sender (VR app) might block or drop messages if this side can't keep up.
+        self.socket.set_hwm(10) 
         
-        # Try to bind with retries
         bound = False
         retry_count = 0
         self.port = port
         
         while not bound and retry_count < max_retries:
             try:
-                # Bind to all interfaces
                 bind_address = f"tcp://0.0.0.0:{self.port}"
                 logging.info(f"Attempting to bind to {bind_address}")
                 self.socket.bind(bind_address)
@@ -88,655 +108,567 @@ class ZMQKeypointPuller:
                 retry_count += 1
                 logging.warning(f"Failed to bind to port {self.port}: {e}")
                 if retry_count < max_retries:
-                    self.port += 1000  # Try a port 1000 higher
+                    self.port += 1000
                     logging.info(f"Retrying with port {self.port}")
-                    time.sleep(1)  # Wait a bit before retrying
+                    time.sleep(1)
                 else:
                     logging.error(f"Failed to bind after {max_retries} retries")
                     raise
         
-        self.poller = zmq.Poller()
-        self.poller.register(self.socket, zmq.POLLIN)
-        
-        # Store message types, their latest data, and timestamps
         self.message_data = {}
         self.message_timestamps = {}
-        self.last_receive_time = time.time()
-        self.data_timeout = data_timeout  # Timeout in seconds
+        self.last_receive_time = time.time() 
+        self.data_timeout = data_timeout
 
-    def recv_keypoints(self, flags=0):
-        if flags == zmq.NOBLOCK:
-            socks = dict(self.poller.poll(0))
-            if self.socket in socks and socks[self.socket] == zmq.POLLIN:
-                try:
-                    message = self.socket.recv_pyobj(flags=flags)
-                    self.last_receive_time = time.time()
-                    if isinstance(message, dict) and 'type' in message and 'data' in message:
-                        message_type = message['type']
-                        self.message_data[message_type] = message['data']
-                        self.message_timestamps[message_type] = time.time()
-                        return message['data']
-                    return message
-                except zmq.ZMQError:
-                    return None
-            return None
-        else:
-            message = self.socket.recv_pyobj()
-            self.last_receive_time = time.time()
+    def recv_keypoints_noblock(self):
+        """ Non-blocking receive. Returns full message dict or None. Updates internal state. """
+        try:
+            message = self.socket.recv_pyobj(flags=zmq.NOBLOCK)
+            self.last_receive_time = time.time() # Update on any successful receive
             if isinstance(message, dict) and 'type' in message and 'data' in message:
                 message_type = message['type']
                 self.message_data[message_type] = message['data']
                 self.message_timestamps[message_type] = time.time()
-                return message['data']
-            return message
-    
+                return message 
+            # logging.warning(f"Received non-standard or malformed ZMQ message: {message}")
+            return None 
+        except zmq.Again: 
+            return None
+        except Exception as e:
+            logging.error(f"Error in ZMQ recv_keypoints_noblock: {e}")
+            return None
+
     def get_latest_data(self, message_type):
-        """Get the latest data for a specific message type."""
         return self.message_data.get(message_type)
     
     def is_data_fresh(self, message_type=None):
-        """
-        Check if data is fresh (received within timeout period).
-        
-        Args:
-            message_type: Specific message type to check, or None to check any message
-            
-        Returns:
-            bool: True if data is fresh, False otherwise
-        """
         current_time = time.time()
-        
-        # If no specific message type, check if any data has been received recently
-        if message_type is None:
+        if message_type is None: # Check overall freshness
             return (current_time - self.last_receive_time) < self.data_timeout
         
-        # Check if the specific message type exists and is fresh
+        # Check freshness for a specific message type
         if message_type in self.message_timestamps:
             return (current_time - self.message_timestamps[message_type]) < self.data_timeout
-        
         return False
 
-
-# class ZMQKeypointPublisher:
-#     """Publisher for ZMQ keypoint data."""
-#     def __init__(self, host, port):
-#         self.context = zmq.Context()
-#         self.socket = self.context.socket(zmq.PUB)
-#         # Always bind to all interfaces (0.0.0.0) to allow connections from any IP
-#         bind_host = "0.0.0.0"
-#         self.socket.bind(f"tcp://{bind_host}:{port}")
-
-#     def pub_keypoints(self, keypoints, topic="keypoints"):
-#         self.socket.send_string(topic, zmq.SNDMORE)
-#         self.socket.send_pyobj(keypoints)
+    def close(self):
+        logging.info(f"Closing ZMQ PULL socket on port {self.port}")
+        if hasattr(self, 'socket') and self.socket and not self.socket.closed:
+            self.socket.close(linger=0) # linger=0 ensures immediate close
+        if hasattr(self, 'context') and self.context and not self.context.closed:
+            self.context.term()
 
 
 class VRTeleoperator:
-    """Class for VR teleoperation of a robot."""
     def __init__(self, robot: Robot, cfg: VRTeleoperateControlConfig):
         self.robot = robot
         self.cfg = cfg
         
-        # Initialize ZMQ subscribers and publishers
-        # Use localhost for subscribers when running locally
-        # This ensures that the subscribers can connect to the publishers
-        # even when the publisher is bound to 0.0.0.0
-        subscriber_host = "localhost" if cfg.host_ip == "localhost" else cfg.host_ip
-        
-        logging.info(f"Initializing ZMQ subscribers with host: {subscriber_host}")
-        
-        # Initialize a single PULL socket for all message types
-        self._keypoint_puller = ZMQKeypointPuller(
-            port=cfg.transformed_keypoint_port
-        )
-        
-        # Store the port for logging
+        logging.info(f"Initializing ZMQ PULL socket for VR Teleoperation.")
+        self._keypoint_puller = ZMQKeypointPuller(port=cfg.transformed_keypoint_port, data_timeout=cfg.vr_data_timeout if hasattr(cfg, 'vr_data_timeout') else 1.0)
         self.keypoint_port = self._keypoint_puller.port
         logging.info(f"VR Teleoperation PULL socket bound to port {self.keypoint_port}")
         
-        # Initialize state variables
-        self.gripper_flag = 1
-        self.pause_flag = 1
-        self.prev_pause_flag = 0
+        self.gripper_flag = True  # Gripper state: True typically means open or 1.0
+        self.pause_flag = True    # Control state: True means ARM_TELEOP_CONT (running)
+        
+        self.prev_pause_flag = not self.pause_flag # Initialize to ensure first check has a delta
         self.is_first_frame = True
         self.gripper_cnt = 0
-        self.prev_gripper_flag = 0
+        self.prev_gripper_flag = not self.gripper_flag # Initialize to ensure first check has a delta
         self.pause_cnt = 0
-        self.gripper_correct_state = 1
-        self.resolution_scale = 1
-        self.arm_teleop_state = ARM_TELEOP_STOP
+        self.gripper_correct_state = 1 if self.gripper_flag else 0 
+        self.resolution_scale = 1.0 
+        self.arm_teleop_state = ARM_TELEOP_STOP # Start stopped; will transition on first valid frame/unpause
         
-        # We'll initialize joint positions when the robot is connected
-        self.initial_joint_positions = {}
+        self.initial_joint_positions = {} # Stores robot joint state at the time of _reset_teleop
+        self.hand_init_frame = None       # Stores hand frame at the time of _reset_teleop
         self.joint_filters = {}
         self.use_filter = cfg.use_filter
         self.initialized = False
+        self.shutdown_requested = False
         
-        # Save the original teleop_step method
         self.original_teleop_step = robot.teleop_step
-        # Replace with our VR teleop_step method
         robot.teleop_step = self.vr_teleop_step
         
         logging.info("VR Teleoperator initialized")
 
-    def robot_pose_aa_to_affine(self, pose_aa: np.ndarray) -> np.ndarray:
-        """
-        Converts a robot pose in axis-angle format to an affine matrix.
-        
-        Args:
-            pose_aa (np.ndarray): [x, y, z, ax, ay, az] where (x, y, z) is the position 
-                                  and (ax, ay, az) is the axis-angle rotation.
-        
-        Returns:
-            np.ndarray: 4x4 affine matrix [[R, t],[0, 1]]
-        """
-        rotation = Rotation.from_rotvec(pose_aa[3:]).as_matrix()
-        translation = np.array(pose_aa[:3])
-
-        return np.block([[rotation, translation[:, np.newaxis]],[0, 0, 0, 1]])
+    def _process_incoming_messages(self):
+        """Helper to process all available messages from the puller and update state."""
+        try:
+            while True: 
+                msg_dict = self._keypoint_puller.recv_keypoints_noblock()
+                if msg_dict is None: 
+                    break 
+                if msg_dict.get('type') == "shutdown":
+                    logging.info("Shutdown message received from VR controller.")
+                    self.shutdown_requested = True
+        except Exception as e:
+            logging.error(f"Error processing incoming ZMQ messages: {e}")
 
     def _get_hand_frame(self):
-        """
-        Get the transformed hand frame.
-        
-        Returns:
-            np.ndarray: Hand frame as a 4x3 matrix
-        """
-        # Try to receive new data
-        for i in range(10):
-            data = self._keypoint_puller.recv_keypoints(flags=zmq.NOBLOCK)
-            if data is not None:
-                break
-        
-        # Get the latest hand frame data
+        # _process_incoming_messages() # Called by parent function like apply_retargeted_angles
         data = self._keypoint_puller.get_latest_data('transformed_hand_frame')
         if data is None:
             return None
         return np.asanyarray(data).reshape(4, 3)
     
     def _get_resolution_scale_mode(self):
-        """
-        Get the resolution scale mode.
-        
-        Returns:
-            int: Resolution scale mode
-        """
-        # Try to receive new data
-        self._keypoint_puller.recv_keypoints(flags=zmq.NOBLOCK)
-        
-        # Get the latest resolution data
+        # _process_incoming_messages()
         data = self._keypoint_puller.get_latest_data('button')
         if data is None:
-            # Default to high resolution if no data is available
-            return ARM_HIGH_RESOLUTION
-        
-        res_scale = np.asanyarray(data).reshape(1)[0]  # Make sure this data is one dimensional
-        return res_scale
+            return ARM_HIGH_RESOLUTION 
+        return np.asanyarray(data).reshape(1)[0]
     
-    def _get_arm_teleop_state_from_hand_keypoints(self):
-        """
-        Get the arm teleoperation state from hand keypoints.
+    def _get_arm_teleop_state_from_keypoints(self):
+        # This method determines the desired teleop state based on finger gestures
+        # It does NOT call _process_incoming_messages; assumes parent caller does.
+        pause_bool_state, pause_status_changed = self.get_pause_state_from_keypoints(process_msg=False) # New: expects 2
+        # pause_bool_state is True if fingers indicate "continue", False if "pause"
         
-        Returns:
-            tuple: (pause_state, pause_status, pause_right)
-        """
-        pause_state, pause_status, pause_right = self.get_pause_state_from_hand_keypoints()
-        pause_status = np.asanyarray(pause_status).reshape(1)[0] 
-
-        return pause_state, pause_status, pause_right
-
-    def _turn_frame_to_homo_mat(self, frame):
-        """
-        Turn a frame to a homogeneous matrix.
-        
-        Args:
-            frame (np.ndarray): Frame as a 4x3 matrix
-        
-        Returns:
-            np.ndarray: 4x4 homogeneous matrix
-        """
-        t = frame[0]
-        R = frame[1:]
-
-        homo_mat = np.zeros((4, 4))
-        homo_mat[:3, :3] = np.transpose(R)
-        homo_mat[:3, 3] = t
-        homo_mat[3, 3] = 1
-
-        return homo_mat
-
-    def _homo2cart(self, homo_mat):
-        """
-        Turn homogeneous matrix to cartesian vector.
-        
-        Args:
-            homo_mat (np.ndarray): 4x4 homogeneous matrix
-        
-        Returns:
-            np.ndarray: Cartesian vector [x, y, z, rx, ry, rz]
-        """
-        t = homo_mat[:3, 3]
-        R = Rotation.from_matrix(
-            homo_mat[:3, :3]).as_rotvec(degrees=False)
-
-        cart = np.concatenate(
-            [t, R], axis=0
-        )
-        return cart
-    
-    def _get_scaled_cart_pose(self, moving_robot_homo_mat):
-        """
-        Get the scaled cartesian pose.
-        
-        Args:
-            moving_robot_homo_mat (np.ndarray): 4x4 homogeneous matrix of the moving robot
-        
-        Returns:
-            np.ndarray: Scaled cartesian pose [x, y, z, rx, ry, rz]
-        """
-        # Get the cart pose without the scaling
-        unscaled_cart_pose = self._homo2cart(moving_robot_homo_mat)
-
-        # Get the current cart pose
-        home_pose = self.robot.get_cartesian_pose()
-        home_pose_array = np.array(home_pose)
-        current_cart_pose = home_pose_array
-
-        # Get the difference in translation between these two cart poses
-        diff_in_translation = unscaled_cart_pose[:3] - current_cart_pose[:3]
-        scaled_diff_in_translation = diff_in_translation * self.resolution_scale
-        
-        scaled_cart_pose = np.zeros(6)
-        scaled_cart_pose[3:] = unscaled_cart_pose[3:]  # Get the rotation directly
-        scaled_cart_pose[:3] = current_cart_pose[:3] + scaled_diff_in_translation  # Get the scaled translation only
-
-        return scaled_cart_pose
+        current_teleop_state_gesture = ARM_TELEOP_CONT if pause_bool_state else ARM_TELEOP_STOP
+            
+        return current_teleop_state_gesture, pause_status_changed
 
     def _initialize(self):
-        """
-        Initialize the VR teleoperator with the current robot state.
-        This should be called after the robot is connected.
-        """
         if not self.robot.is_connected:
             logging.warning("Robot is not connected. Cannot initialize VR teleoperator.")
             return False
-            
         try:
-            # Initialize joint positions
             self.initial_joint_positions = {}
             for name in self.robot.follower_arms:
                 joint_pos = self.robot.follower_arms[name].read("Present_Position")
                 self.initial_joint_positions[name] = torch.from_numpy(joint_pos)
             
-            # Initialize filters
+            # Filter initialization:
+            # The provided Filter class is for 6D Cartesian states.
+            # Applying it to joint angles is only appropriate if the robot has exactly 6 joints
+            # and this specific filtering (Slerp on last 3 elements) is desired for those joints.
+            # If cfg.use_filter is True, we attempt to initialize.
             if self.use_filter:
-                self.joint_filters = {}
-                for name, pos in self.initial_joint_positions.items():
-                    self.joint_filters[name] = Filter(pos.numpy(), comp_ratio=self.cfg.filter_ratio)
+                self.joint_filters = {} # Clear previous
+                for name, pos_tensor in self.initial_joint_positions.items():
+                    pos_numpy = pos_tensor.numpy()
+                    if len(pos_numpy) >= 6:
+                        try:
+                            self.joint_filters[name] = Filter(pos_numpy.copy(), comp_ratio=self.cfg.filter_ratio)
+                        except ValueError as e:
+                             logging.warning(f"Could not initialize Filter for arm '{name}' (requires >=6 values, got {len(pos_numpy)}): {e}. Filtering disabled for this arm.")
+                    else:
+                        logging.warning(f"Filter not applied to arm '{name}': requires at least 6 values, got {len(pos_numpy)}. Filtering disabled for this arm.")
             
             self.initialized = True
             logging.info("VR teleoperator initialized successfully")
             return True
         except Exception as e:
-            logging.error(f"Error initializing VR teleoperator: {e}")
+            logging.error(f"Error initializing VR teleoperator: {e}", exc_info=True)
+            self.initialized = False 
             return False
 
     def _reset_teleop(self):
-        """
-        Reset teleoperation and make the current frame as initial frame.
-        
-        Returns:
-            None
-        """
         logging.info('****** RESETTING TELEOP ****** ')
-        
-        # Make sure we're initialized
         if not self.initialized:
-            success = self._initialize()
-            if not success:
-                logging.error("Failed to initialize VR teleoperator during reset")
+            if not self._initialize(): # Try to initialize if not already
+                logging.error("Failed to initialize VR teleoperator during reset. Aborting reset.")
                 return
         
-        # Reset joint positions
-        self.initial_joint_positions = {}
+        # Update initial joint positions for the robot
+        new_initial_joint_positions = {}
         for name in self.robot.follower_arms:
-            joint_pos = self.robot.follower_arms[name].read("Present_Position")
-            self.initial_joint_positions[name] = torch.from_numpy(joint_pos)
-        
-        # Reset filters
+            try:
+                joint_pos = self.robot.follower_arms[name].read("Present_Position")
+                new_initial_joint_positions[name] = torch.from_numpy(joint_pos)
+            except Exception as e:
+                logging.error(f"Could not read joint positions for arm {name} during reset: {e}")
+                # Keep old initial position if read fails, or handle error more gracefully
+                if name in self.initial_joint_positions:
+                    new_initial_joint_positions[name] = self.initial_joint_positions[name]
+                else: # Critical failure for this arm
+                    logging.error(f"Cannot proceed with reset for arm {name} without initial position.")
+                    self.arm_teleop_state = ARM_TELEOP_STOP # Safety
+                    return
+        self.initial_joint_positions = new_initial_joint_positions
+
+        # Re-initialize filters with new initial positions if filter is enabled
         if self.use_filter:
-            self.joint_filters = {}
-            for name, pos in self.initial_joint_positions.items():
-                self.joint_filters[name] = Filter(pos.numpy(), comp_ratio=self.cfg.filter_ratio)
-        
-        # Get initial hand frame
+            self.joint_filters = {} 
+            for name, pos_tensor in self.initial_joint_positions.items():
+                pos_numpy = pos_tensor.numpy()
+                if len(pos_numpy) >= 6 :
+                    try:
+                        self.joint_filters[name] = Filter(pos_numpy.copy(), comp_ratio=self.cfg.filter_ratio)
+                    except ValueError as e:
+                        logging.warning(f"Could not re-initialize Filter for arm '{name}' during reset: {e}. Filtering disabled for this arm.")
+                else:
+                     logging.warning(f"Filter not applied to arm '{name}' during reset: requires at least 6 values, got {len(pos_numpy)}. Filtering disabled for this arm.")
+
+        # Get initial hand frame (make sure messages are processed first)
+        self._process_incoming_messages()
         first_hand_frame = self._get_hand_frame()
-        while first_hand_frame is None:
+        retry_count = 0
+        max_retries = int(5 / 0.1) # Wait up to 5 seconds, checking every 0.1s
+        while first_hand_frame is None and retry_count < max_retries and not self.shutdown_requested:
+            logging.info("Waiting for initial hand frame to reset teleop...")
+            time.sleep(0.1)
+            self._process_incoming_messages() # Process messages again before getting data
             first_hand_frame = self._get_hand_frame()
+            retry_count += 1
         
+        if first_hand_frame is None:
+            logging.error("Failed to get initial hand frame for reset. Teleop might not function correctly.")
+            self.is_first_frame = True 
+            self.arm_teleop_state = ARM_TELEOP_STOP # Safety stop
+            return
+
         self.hand_init_frame = first_hand_frame
         self.is_first_frame = False
-        logging.info("Resetting complete")
+        logging.info("Resetting teleop complete")
 
-    def get_gripper_state_from_hand_keypoints(self):
-        """
-        Get gripper state from hand keypoints.
-        
-        Returns:
-            tuple: (gripper_state, status, gripper_fl)
-        """
-        # Try to receive new data
-        self._keypoint_puller.recv_keypoints(flags=zmq.NOBLOCK)
-        
-        # Get the latest hand coordinates
+    def get_gripper_state_from_keypoints(self, process_msg=True):
+        if process_msg: self._process_incoming_messages()
         transformed_hand_coords = self._keypoint_puller.get_latest_data('transformed_hand_coords')
+        
         if transformed_hand_coords is None:
-            return self.gripper_flag, False, False
+            return self.gripper_flag, False # current state, did not change status
+
         distance = np.linalg.norm(transformed_hand_coords[OCULUS_JOINTS['pinky'][-1]] - transformed_hand_coords[OCULUS_JOINTS['thumb'][-1]])
         thresh = 0.03
-        gripper_fl = False
+        toggled_this_step = False
         if distance < thresh:
             self.gripper_cnt += 1
-            if self.gripper_cnt == 1:
-                self.prev_gripper_flag = self.gripper_flag
+            if self.gripper_cnt == 1: 
+                self.prev_gripper_flag = self.gripper_flag # Store before toggle
                 self.gripper_flag = not self.gripper_flag 
-                gripper_fl = True
+                toggled_this_step = True
         else: 
-            self.gripper_cnt = 0
-        gripper_state = np.asanyarray(self.gripper_flag).reshape(1)[0]
-        status = False  
-        if gripper_state != self.prev_gripper_flag:
-            status = True
-        return gripper_state, status, gripper_fl 
+            self.gripper_cnt = 0 
+        
+        status_changed = toggled_this_step # True if state was toggled *this specific step*
+        return self.gripper_flag, status_changed
    
-    def get_pause_state_from_hand_keypoints(self):
-        """
-        Toggle the robot to pause/resume using ring/middle finger pinch.
-        
-        Returns:
-            tuple: (pause_state, pause_status, pause_right)
-        """
-        # Try to receive new data
-        self._keypoint_puller.recv_keypoints(flags=zmq.NOBLOCK)
-        
-        # Get the latest hand coordinates
+    def get_pause_state_from_keypoints(self, process_msg=True):
+        if process_msg: self._process_incoming_messages()
         transformed_hand_coords = self._keypoint_puller.get_latest_data('transformed_hand_coords')
+
         if transformed_hand_coords is None:
-            return self.pause_flag, False, True
+            return self.pause_flag, False # current state, did not change status
+
         ring_distance = np.linalg.norm(transformed_hand_coords[OCULUS_JOINTS['ring'][-1]] - transformed_hand_coords[OCULUS_JOINTS['thumb'][-1]])
         middle_distance = np.linalg.norm(transformed_hand_coords[OCULUS_JOINTS['middle'][-1]] - transformed_hand_coords[OCULUS_JOINTS['thumb'][-1]])
         thresh = 0.03 
-        pause_right = True
+        toggled_this_step = False
         if ring_distance < thresh or middle_distance < thresh:
             self.pause_cnt += 1
-            if self.pause_cnt == 1:
-                self.prev_pause_flag = self.pause_flag
-                self.pause_flag = not self.pause_flag       
+            if self.pause_cnt == 1: 
+                self.prev_pause_flag = self.pause_flag # Store before toggle
+                self.pause_flag = not self.pause_flag 
+                toggled_this_step = True
         else:
-            self.pause_cnt = 0
-        pause_state = np.asanyarray(self.pause_flag).reshape(1)[0]
-        pause_status = False  
-        if pause_state != self.prev_pause_flag:
-            pause_status = True 
-        return pause_state, pause_status, pause_right
+            self.pause_cnt = 0 
+        
+        status_changed = toggled_this_step # True if state was toggled *this specific step*
+        return self.pause_flag, status_changed
 
     def apply_retargeted_angles(self):
-        """
-        Apply retargeted angles to the robot.
-        
-        Returns:
-            dict: Action to send to the robot
-        """
-        # Make sure we're initialized
+        # This method is called after _process_incoming_messages has run in vr_teleop_step
         if not self.initialized:
-            success = self._initialize()
-            if not success:
-                logging.error("Failed to initialize VR teleoperator during apply_retargeted_angles")
+            if not self._initialize():
+                logging.error("Cannot apply_retargeted_angles: VR teleoperator not initialized.")
                 return None
         
-        # See if there is a reset in the teleop state
-        new_arm_teleop_state, pause_status, pause_right = self._get_arm_teleop_state_from_hand_keypoints()
-        if self.is_first_frame or (self.arm_teleop_state == ARM_TELEOP_STOP and new_arm_teleop_state == ARM_TELEOP_CONT):
-            self._reset_teleop()  # Reset the teleop state
-        
-        self.arm_teleop_state = new_arm_teleop_state
-        arm_teleoperation_scale_mode = self._get_resolution_scale_mode()
+        # Determine desired teleop state from gestures
+        # Note: self.shutdown_requested is already updated by _process_incoming_messages
+        desired_teleop_state_gesture, pause_status_changed = self._get_arm_teleop_state_from_keypoints()
 
+        if self.is_first_frame or \
+           (self.arm_teleop_state == ARM_TELEOP_STOP and desired_teleop_state_gesture == ARM_TELEOP_CONT):
+            if not self.shutdown_requested: 
+                self._reset_teleop()
+                if self.is_first_frame: # If _reset_teleop failed to get hand_init_frame
+                    self.arm_teleop_state = ARM_TELEOP_STOP # Stay stopped
+                    return None
+            else: # Shutdown requested during this initial phase
+                self.is_first_frame = False 
+                self.arm_teleop_state = ARM_TELEOP_STOP
+                return None
+
+        self.arm_teleop_state = desired_teleop_state_gesture
+        if self.shutdown_requested: # Shutdown overrides gesture
+            self.arm_teleop_state = ARM_TELEOP_STOP
+        
+        if self.arm_teleop_state == ARM_TELEOP_STOP:
+            return None 
+
+        # --- Robot is running: ARM_TELEOP_CONT ---
+        arm_teleoperation_scale_mode = self._get_resolution_scale_mode() 
         if arm_teleoperation_scale_mode == ARM_HIGH_RESOLUTION:
-            self.resolution_scale = 1
+            self.resolution_scale = 1.0
         elif arm_teleoperation_scale_mode == ARM_LOW_RESOLUTION:
             self.resolution_scale = 0.6
 
-        # Get hand frame
-        moving_hand_frame = self._get_hand_frame()
-        if moving_hand_frame is None:
-            return None  # It means we are not on the arm mode yet
+        moving_hand_frame = self._get_hand_frame() 
+        if moving_hand_frame is None or self.hand_init_frame is None:
+            # If hand_init_frame is None, reset probably failed.
+            logging.warning("apply_retargeted_angles: Missing hand frame data. Stopping movement.")
+            self.arm_teleop_state = ARM_TELEOP_STOP 
+            return None
 
-        # Process hand frame to get joint positions
-        # For simplicity, we'll map hand movements to joint position changes
-        # This is a simplified approach - in a real implementation, you would use inverse kinematics
-        
-        # Get current joint positions
-        current_joint_positions = {}
+        # --- Calculate Action ---
+        current_robot_joint_positions = {}
         for name in self.robot.follower_arms:
-            joint_pos = self.robot.follower_arms[name].read("Present_Position")
-            current_joint_positions[name] = torch.from_numpy(joint_pos)
+            current_robot_joint_positions[name] = torch.from_numpy(self.robot.follower_arms[name].read("Present_Position"))
         
-        # Calculate joint position changes based on hand movement
-        joint_position_changes = {}
-        for name, initial_pos in self.initial_joint_positions.items():
-            # Extract hand movement features
-            hand_translation = moving_hand_frame[0]  # x, y, z
-            hand_rotation = moving_hand_frame[1:]    # 3x3 rotation matrix
-            
-            # Map hand movement to joint changes
-            # This is a simplified mapping - adjust based on your robot's kinematics
-            num_joints = len(initial_pos)
-            joint_changes = np.zeros(num_joints)
-            
-            # Map x, y, z translation to first 3 joints (if available)
-            if num_joints >= 3:
-                joint_changes[0] = hand_translation[0] * self.resolution_scale * 100  # shoulder_pan
-                joint_changes[1] = hand_translation[1] * self.resolution_scale * 100  # shoulder_lift
-                joint_changes[2] = hand_translation[2] * self.resolution_scale * 100  # elbow_flex
-            
-            # Map rotation to next 3 joints (if available)
-            if num_joints >= 6:
-                # Extract Euler angles from rotation matrix
-                euler = Rotation.from_matrix(hand_rotation).as_euler('xyz')
-                joint_changes[3] = euler[0] * self.resolution_scale * 50  # wrist_flex
-                joint_changes[4] = euler[1] * self.resolution_scale * 50  # wrist_roll
-                joint_changes[5] = euler[2] * self.resolution_scale * 50  # additional joint if available
-            
-            # Calculate new joint positions
-            new_joint_positions = current_joint_positions[name] + torch.from_numpy(joint_changes).float()
-            
-            # Apply filter if enabled
-            if self.use_filter:
-                new_joint_positions = torch.from_numpy(
-                    self.joint_filters[name](new_joint_positions.numpy())
-                ).float()
-            
-            joint_position_changes[name] = new_joint_positions
+        action_output_joint_positions = {}
         
-        # Get gripper state
-        gripper_state, status_change, gripper_flag = self.get_gripper_state_from_hand_keypoints()
-        if gripper_flag == 1 and status_change is True:
-            self.gripper_correct_state = gripper_state
+        # --- Hand to Joint Mapping (Preserved from original, with deltas relative to init hand pose) ---
+        # This maps hand pose (relative to its pose at teleop reset) to robot joint *increments*.
+        # These increments are then added to the *current* robot joint positions.
+        for name, initial_robot_joints_at_reset in self.initial_joint_positions.items():
+            hand_trans_abs = moving_hand_frame[0]
+            hand_rot_abs_mat = moving_hand_frame[1:]
+
+            # Calculate hand deltas relative to the hand pose at the last _reset_teleop
+            hand_trans_delta = hand_trans_abs - self.hand_init_frame[0]
+            
+            R_init_hand = Rotation.from_matrix(self.hand_init_frame[1:])
+            R_current_hand = Rotation.from_matrix(hand_rot_abs_mat)
+            R_delta_hand = R_init_hand.inv() * R_current_hand
+            euler_delta_hand = R_delta_hand.as_euler('xyz') # More stable for delta mapping
+
+            num_joints = len(initial_robot_joints_at_reset)
+            joint_deltas_to_apply = np.zeros(num_joints)
+            
+            # Heuristic mapping from hand deltas to joint deltas
+            # Adjust scaling factors (100, 50) as needed for your robot's sensitivity
+            if num_joints >= 1: joint_deltas_to_apply[0] = hand_trans_delta[0] * self.resolution_scale * 100 
+            if num_joints >= 2: joint_deltas_to_apply[1] = hand_trans_delta[1] * self.resolution_scale * 100 
+            if num_joints >= 3: joint_deltas_to_apply[2] = hand_trans_delta[2] * self.resolution_scale * 100
+            
+            if num_joints >= 6: # Assuming joints 3,4,5 map to euler X,Y,Z changes
+                joint_deltas_to_apply[3] = euler_delta_hand[0] * self.resolution_scale * 50 
+                joint_deltas_to_apply[4] = euler_delta_hand[1] * self.resolution_scale * 50 
+                joint_deltas_to_apply[5] = euler_delta_hand[2] * self.resolution_scale * 50 
+            
+            # New target joint positions = current robot joints + calculated deltas
+            # This means the robot moves relative to its current pose based on how far the hand
+            # has moved from its initial pose at reset.
+            target_joint_positions = current_robot_joint_positions[name] + torch.from_numpy(joint_deltas_to_apply).float()
+
+            if self.use_filter and name in self.joint_filters:
+                try:
+                    target_joint_positions = torch.from_numpy(
+                        self.joint_filters[name](target_joint_positions.numpy().copy()) # Pass copy
+                    ).float()
+                except Exception as e:
+                    logging.warning(f"Error applying filter to arm {name}: {e}. Using unfiltered values.")
+
+            action_output_joint_positions[name] = target_joint_positions
         
-        # Create action dictionary with joint positions
-        action = {}
-        for name, pos in joint_position_changes.items():
-            action[name] = pos
+        # --- Gripper State ---
+        gripper_bool_state, gripper_status_changed = self.get_gripper_state_from_keypoints(process_msg=False)
+        if gripper_status_changed: 
+            self.gripper_correct_state = 1 if gripper_bool_state else 0
         
-        # Add gripper state
-        action["gripper"] = self.gripper_correct_state
+        # --- Assemble Action Dictionary ---
+        final_action = {}
+        for name, pos in action_output_joint_positions.items():
+            final_action[name] = pos
+        final_action["gripper"] = self.gripper_correct_state 
         
-        return action
+        return final_action
 
     def vr_teleop_step(self, record_data=False):
-        """
-        VR teleoperation step method that replaces the robot's teleop_step method.
-        This method is called by the control_loop function.
-        
-        Args:
-            record_data (bool): Whether to record data for dataset creation
-            
-        Returns:
-            tuple: (observation_dict, action_dict) if record_data is True, None otherwise
-        """
-        # Make sure we're initialized
         if not self.initialized:
-            success = self._initialize()
-            if not success:
+            if not self._initialize():
                 logging.error("Failed to initialize VR teleoperator during teleop step")
                 if record_data:
-                    # Return empty observation and action
-                    observation = self.robot.capture_observation()
-                    action_dict = {"action": torch.zeros(1)}
-                    return observation, action_dict
+                    observation = self.robot.capture_observation() if self.robot.is_connected else {}
+                    # Determine action dimension safely
+                    act_dim = 1
+                    if hasattr(self.robot, "action_space") and self.robot.action_space and hasattr(self.robot.action_space, "shape"):
+                         act_dim = self.robot.action_space.shape[0]
+                    elif self.robot.follower_arms: # Fallback to number of joints of first arm if possible
+                        first_arm_name = next(iter(self.robot.follower_arms))
+                        try:
+                            act_dim = len(self.robot.follower_arms[first_arm_name].read("Present_Position"))
+                        except: pass # Keep act_dim = 1
+                            
+                    action_dict = {"action": torch.zeros(act_dim), "gripper": torch.tensor([self.gripper_correct_state], dtype=torch.float32)}
+                    return observation, action_dict, {}
                 return None
-        
-        # Check if we're still receiving fresh data
-        if not self._keypoint_puller.is_data_fresh():
-            logging.warning("No fresh data received, stopping robot movement")
+
+        self._process_incoming_messages() # Process ZMQ, potentially sets self.shutdown_requested
+
+        action_to_execute = None # Default to no action
+
+        # Check for explicit shutdown request or critical data loss leading to shutdown
+        if self.shutdown_requested:
+            logging.info("VR teleop step: Shutdown requested. Halting robot.")
             self.arm_teleop_state = ARM_TELEOP_STOP
+        elif not self._keypoint_puller.is_data_fresh(None) and \
+             (time.time() - self._keypoint_puller.last_receive_time > (self._keypoint_puller.data_timeout + 4.0)): # Extended timeout
+            logging.error(f"VR teleop step: Connection to VR controller appears lost (timeout > {self._keypoint_puller.data_timeout + 4.0}s). Forcing shutdown.")
+            self.shutdown_requested = True # Escalate to full shutdown
+            self.arm_teleop_state = ARM_TELEOP_STOP
+        
+        # If not actively shutting down, call apply_retargeted_angles.
+        # This method will handle state transitions (STOP <-> CONT) based on gestures/reset logic
+        # and will update self.arm_teleop_state. It returns an action or None.
+        if not self.shutdown_requested:
+            action_to_execute = self.apply_retargeted_angles()
+        
+        # After apply_retargeted_angles, self.arm_teleop_state reflects the current desired state.
+        # If action_to_execute is None or state is STOP, then no motion.
+        if action_to_execute is None or self.arm_teleop_state == ARM_TELEOP_STOP:
+            if self.arm_teleop_state == ARM_TELEOP_STOP and not self.shutdown_requested:
+                 # This log can be noisy if frequently paused, use logging.debug or remove if too verbose
+                 # logging.info("Robot is paused or waiting for initial valid data to start/resume.")
+                 pass
             
-            # If it's been a while since we received data, log a more serious warning
-            if time.time() - self._keypoint_puller.last_receive_time > 5.0:
-                logging.error("Connection to VR controller appears to be lost")
-        
-        # Get action from VR teleoperation
-        action = self.apply_retargeted_angles()
-        
-        # If no valid action or paused, return None or empty dicts
-        if action is None or self.arm_teleop_state == ARM_TELEOP_STOP:
-            if record_data:
-                # Create empty observation and action dictionaries
-                observation = self.robot.capture_observation()
-                # Create an empty action with the right dimensions
-                empty_action = []
-                for name in self.robot.follower_arms:
-                    joint_pos = self.robot.follower_arms[name].read("Present_Position")
-                    empty_action.append(torch.from_numpy(joint_pos))
-                action_tensor = torch.cat(empty_action)
-                action_dict = {"action": action_tensor}
-                return observation, action_dict
-            return None
+            if record_data: # If recording, provide current state as "action" (hold position)
+                observation = self.robot.capture_observation() if self.robot.is_connected else {}
+                joint_values_for_action = []
+                act_dim = 1 # Default action dimension
+                if self.robot.is_connected:
+                    if self.robot.follower_arms:
+                        first_arm_name = next(iter(self.robot.follower_arms))
+                        try:
+                             # Get full action dim from all follower arms' joints
+                            current_joint_dims = 0
+                            for name in self.robot.follower_arms:
+                                joint_pos = self.robot.follower_arms[name].read("Present_Position")
+                                joint_values_for_action.append(torch.from_numpy(joint_pos))
+                                current_joint_dims += len(joint_pos)
+                            if current_joint_dims > 0: act_dim = current_joint_dims
+                        except Exception as e:
+                            logging.error(f"Error reading Present_Position for arms (record_data stop): {e}")
+                            if hasattr(self.robot, "action_space") and self.robot.action_space and hasattr(self.robot.action_space, "shape"):
+                                act_dim = self.robot.action_space.shape[0] # Fallback to configured action space
+                    elif hasattr(self.robot, "action_space") and self.robot.action_space and hasattr(self.robot.action_space, "shape"):
+                        act_dim = self.robot.action_space.shape[0]
+
+
+                action_tensor = torch.cat(joint_values_for_action) if joint_values_for_action else torch.zeros(act_dim, dtype=torch.float32)
+                action_dict_to_return = {"action": action_tensor, "gripper": torch.tensor([self.gripper_correct_state], dtype=torch.float32)}
+                return observation, action_dict_to_return
+            return None # No action to send if not recording and stopped/paused
+
+        # If we reach here, action_to_execute is not None and self.arm_teleop_state is ARM_TELEOP_CONT
         
         # Process the action for each arm
         for name in self.robot.follower_arms:
-            if name in action:
-                # Get the joint positions for this arm
-                joint_positions = action[name]
-                
-                # Convert to numpy and send to the robot
+            if name in action_to_execute and self.robot.is_connected:
+                joint_positions = action_to_execute[name]
                 joint_positions_np = joint_positions.numpy().astype(np.float32)
-                self.robot.follower_arms[name].write("Goal_Position", joint_positions_np)
+                try:
+                    self.robot.follower_arms[name].write("Goal_Position", joint_positions_np)
+                except Exception as e:
+                    logging.error(f"Error writing Goal_Position for {name}: {e}")
         
-        # Handle gripper separately if needed
-        if "gripper" in action:
-            gripper_state = action["gripper"]
-            # In a real implementation, you would control the gripper here
-            # For now, we'll just log it
-            logging.info(f"Gripper state: {gripper_state}")
-        
-        # Log robot state to rerun if display is enabled
+        if "gripper" in action_to_execute and self.robot.is_connected:
+            gripper_cmd = action_to_execute["gripper"] 
+            # logging.info(f"Gripper command: {gripper_cmd}") # Implement actual gripper control
+            # self.robot.set_gripper(float(gripper_cmd)) # Example
+
         if self.cfg.display_data:
             self._log_robot_state_to_rerun()
         
-        # If recording data, return observation and action
-        if record_data:
-            observation = self.robot.capture_observation()
+        if record_data: # If recording, format and return observation and executed action
+            observation = self.robot.capture_observation() if self.robot.is_connected else {}
             
-            # Create action tensor from all joint positions
-            action_tensors = []
-            for name in self.robot.follower_arms:
-                if name in action:
-                    action_tensors.append(action[name])
-            
-            action_tensor = torch.cat(action_tensors)
-            action_dict = {"action": action_tensor}
-            
-            return observation, action_dict
+            recorded_action_tensors = []
+            act_dim_final = 1 # Default
+            if self.robot.is_connected:
+                current_joint_dims_rec = 0
+                for name in self.robot.follower_arms:
+                    if name in action_to_execute: 
+                        recorded_action_tensors.append(action_to_execute[name])
+                        current_joint_dims_rec += len(action_to_execute[name])
+                if current_joint_dims_rec > 0: act_dim_final = current_joint_dims_rec
+                elif hasattr(self.robot, "action_space") and self.robot.action_space and hasattr(self.robot.action_space, "shape"):
+                     act_dim_final = self.robot.action_space.shape[0]
+
+            final_action_tensor = torch.cat(recorded_action_tensors) if recorded_action_tensors else torch.zeros(act_dim_final, dtype=torch.float32)
+            action_dict_to_return = {
+                "action": final_action_tensor, 
+                "gripper": torch.tensor([action_to_execute.get("gripper", self.gripper_correct_state)], dtype=torch.float32)
+            }
+            return observation, action_dict_to_return
         
         return None
-    
+
     def _log_robot_state_to_rerun(self):
-        """Log robot state to rerun for visualization."""
-        if not self.initialized:
+        if not self.initialized or not rr or not self.robot.is_connected or not self.cfg.display_data:
             return
-            
         try:
-            # Get joint positions for all arms
-            joint_positions = []
-            for name in self.robot.follower_arms:
+            robot_name_prefix = self.robot.name if hasattr(self.robot, "name") else "robot"
+            current_time_ns = int(time.time() * 1e9) # For Rerun time
+            rr.set_time_nanos("sim_time", current_time_ns)
+
+            all_joint_positions_dict = {}
+            for arm_idx, name in enumerate(self.robot.follower_arms):
                 pos = self.robot.follower_arms[name].read("Present_Position")
-                joint_positions.extend(pos)
+                for joint_idx, p_val in enumerate(pos):
+                     all_joint_positions_dict[f"arm{arm_idx}/joint{joint_idx}"] = p_val
+            if all_joint_positions_dict:
+                 rr.log(f"{robot_name_prefix}/joint_positions", rr. MuitosScalars(all_joint_positions_dict))
             
-            # Convert to numpy array
-            joint_positions = np.array(joint_positions)
+            rr.log(f"{robot_name_prefix}/gripper_state", rr.Scalar(self.gripper_correct_state))
             
-            # Log to rerun
-            rr.log("robot/joint_positions", rr.Points3D(joint_positions))
-            
-            # Log gripper state
-            rr.log("robot/gripper", rr.Scalar(self.gripper_correct_state))
-            
-            # Log VR controller state if available
-            hand_frame = self._get_hand_frame()
-            if hand_frame is not None:
-                # Extract translation and rotation
-                translation = hand_frame[0]
-                rotation = Rotation.from_matrix(hand_frame[1:]).as_quat()
-                
-                # Log to rerun
-                rr.log("vr/hand_pose", rr.Transform3D(
-                    translation=translation,
-                    rotation=rotation
-                ))
+            hand_frame_data = self._keypoint_puller.get_latest_data('transformed_hand_frame')
+            if hand_frame_data is not None:
+                hand_frame_np = np.asanyarray(hand_frame_data).reshape(4,3)
+                translation = hand_frame_np[0]
+                # The hand_frame[1:] is R (cols are basis vectors of new frame in old frame)
+                # Rerun Transform3D expects mat3x3 for rotation where columns are basis vectors.
+                rotation_matrix = hand_frame_np[1:] 
+                rr.log("vr_controller/hand_pose", rr.Transform3D(translation=translation, mat3x3=rotation_matrix))
         except Exception as e:
-            logging.error(f"Error logging to rerun: {e}")
+            logging.error(f"Error logging to rerun: {e}", exc_info=True)
 
 
 @safe_disconnect
 def teleoperate_vr(robot: Robot, cfg: VRTeleoperateControlConfig):
-    """
-    Teleoperate a robot using VR controllers.
+    # #log_say("Starting VR teleoperation", cfg.play_sounds)
     
-    Args:
-        robot (Robot): Robot to teleoperate
-        cfg (VRTeleoperateControlConfig): VR teleoperation configuration
-    """
-    #log_say("Starting VR teleoperation", cfg.play_sounds)
-    
-    # First connect to the robot
     if not robot.is_connected:
-        robot.connect()
-    
-    # Initialize VR teleoperator
+        try:
+            robot.connect()
+        except Exception as e:
+            logging.error(f"Failed to connect to robot: {e}")
+            # #log_say("Failed to connect to robot.", cfg.play_sounds)
+            return 
+
     teleoperator = VRTeleoperator(robot, cfg)
     
-    # Log the actual port being used (which might be different from the configured port)
-    logging.info(f"VR Teleoperation is listening on port {teleoperator.keypoint_port}")
-    print(f"VR Teleoperation is listening on port {teleoperator.keypoint_port}")
+    logging.info(f"VR Teleoperation PULL socket is listening on TCP port {teleoperator.keypoint_port} (all interfaces: 0.0.0.0)")
+    print(f"VR Teleoperation PULL socket is listening on TCP port {teleoperator.keypoint_port} (all interfaces: 0.0.0.0)")
     
     try:
-        # Use the standard control_loop function
         control_loop(
             robot=robot,
             control_time_s=cfg.teleop_time_s,
             fps=cfg.fps,
-            teleoperate=True,
+            teleoperate=True, 
             display_data=cfg.display_data,
         )
     except KeyboardInterrupt:
-        logging.info("VR teleoperation interrupted by user")
+        logging.info("VR teleoperation interrupted by user.")
     except Exception as e:
-        logging.error(f"Error during VR teleoperation: {e}")
+        logging.error(f"Unhandled error during VR teleoperation: {e}", exc_info=True)
     finally:
-        # Restore the original teleop_step method
-        if hasattr(teleoperator, 'original_teleop_step'):
+        logging.info("Cleaning up VR teleoperation resources...")
+        # #log_say("Stopping VR teleoperation.", cfg.play_sounds)
+        if hasattr(teleoperator, 'shutdown_requested'): # Signal shutdown to teleoperator loop if not already
+            teleoperator.shutdown_requested = True 
+            time.sleep(1/cfg.fps + 0.1) # Give one loop cycle chance to process shutdown
+
+        if hasattr(teleoperator, 'original_teleop_step') and robot:
             robot.teleop_step = teleoperator.original_teleop_step
+        if hasattr(teleoperator, '_keypoint_puller'):
+            teleoperator._keypoint_puller.close()
+        # Robot disconnection is typically handled by @safe_disconnect decorator
+        # or by the script that calls this function.
     
-    #log_say("VR teleoperation complete", cfg.play_sounds)
+    logging.info("VR teleoperation complete.")
+    # #log_say("VR teleoperation complete.", cfg.play_sounds)

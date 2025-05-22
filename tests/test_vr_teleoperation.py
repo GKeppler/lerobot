@@ -21,8 +21,8 @@ import argparse
 import numpy as np
 import time
 import zmq
-import threading
-import logging
+# import threading # Not used
+# import logging # Not used directly, print is used
 from scipy.spatial.transform import Rotation
 
 # Constants for VR teleoperation
@@ -31,7 +31,7 @@ ARM_TELEOP_CONT = 1
 ARM_HIGH_RESOLUTION = 0
 ARM_LOW_RESOLUTION = 1
 
-# Define the Oculus joints mapping
+# Define the Oculus joints mapping (copied for completeness, not strictly needed by pusher)
 OCULUS_JOINTS = {
     'wrist': [0],
     'thumb': [1, 2, 3, 4],
@@ -47,8 +47,10 @@ class ZMQKeypointPusher:
     def __init__(self, host, port, max_retries=5, heartbeat_interval=0.5):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUSH)
+        # Set a High Water Mark on the sender too. If the receiver is slow,
+        # this will cause send to block or error rather than buffer indefinitely.
+        self.socket.set_hwm(10) 
         
-        # Try to connect with retries and port increment
         connected = False
         retry_count = 0
         self.port = port
@@ -57,207 +59,187 @@ class ZMQKeypointPusher:
         while not connected and retry_count < max_retries:
             try:
                 connection_string = f"tcp://{host}:{self.port}"
+                print(f"Attempting to connect PUSH socket to {connection_string}...")
                 self.socket.connect(connection_string)
                 connected = True
-                print(f"Successfully connected to {connection_string}")
+                print(f"Successfully connected PUSH socket to {connection_string}")
             except zmq.error.ZMQError as e:
                 retry_count += 1
                 print(f"Failed to connect to {host}:{self.port}: {e}")
                 if retry_count < max_retries:
-                    self.port += 1000  # Try a port 1000 higher
-                    print(f"Retrying with port {self.port}")
-                    time.sleep(1)  # Wait a bit before retrying
+                    # Port increment on client side is not standard if server binds to a fixed (or auto-selected then fixed) port.
+                    # Client should retry connection to the *same* port the server is on.
+                    # self.port += 1000 # Removing this, client should know server port.
+                    print(f"Retrying connection to {host}:{self.port}...")
+                    time.sleep(1)
                 else:
-                    raise Exception(f"Failed to connect after {max_retries} retries")
+                    print(f"Failed to connect PUSH socket after {max_retries} retries.")
+                    raise # Re-raise the exception to stop the script
         
-        # Setup heartbeat
         self.heartbeat_interval = heartbeat_interval
         self.last_heartbeat_time = 0
         
     def push_keypoints(self, keypoints, message_type="keypoints"):
-        """Push keypoints with a message type identifier and timestamp."""
         message = {
             'type': message_type,
             'data': keypoints,
             'timestamp': time.time()
         }
-        self.socket.send_pyobj(message)
-    
+        try:
+            self.socket.send_pyobj(message, flags=zmq.NOBLOCK) # Try non-blocking send
+        except zmq.Again:
+            print(f"Warning: ZMQ PUSH socket buffer full (sending {message_type}). Message might be dropped or delayed.")
+            # Optionally, implement retry or blocking send here if NOBLOCK is too aggressive
+            # self.socket.send_pyobj(message) # Fallback to blocking send
+
     def send_heartbeat(self):
-        """Send a heartbeat message to keep the connection alive."""
         current_time = time.time()
         if current_time - self.last_heartbeat_time >= self.heartbeat_interval:
             self.push_keypoints(np.array([current_time]), "heartbeat")
             self.last_heartbeat_time = current_time
         
-    def get_port(self):
+    def get_port(self): # Port it's trying to connect to
         return self.port
+
+    def close(self):
+        print(f"Closing ZMQ PUSH socket connected to {self.host}:{self.port}")
+        if hasattr(self, 'socket') and self.socket and not self.socket.closed:
+            self.socket.close(linger=0)
+        if hasattr(self, 'context') and self.context and not self.context.closed:
+            self.context.term()
 
 
 def generate_hand_frame(t):
-    """
-    Generate a simulated hand frame for testing.
+    # Circular motion in XY plane, sinusoidal in Z
+    x = 0.1 * np.sin(t * 0.5)  # Slower XY circle
+    y = 0.1 * np.cos(t * 0.5)
+    z = 0.05 * np.sin(t)     # Base Z at 0, moves +/- 0.05m (robot relative)
     
-    Args:
-        t (float): Time parameter to create movement
-        
-    Returns:
-        np.ndarray: 4x3 hand frame matrix
-    """
-    # Create a translation that moves in a circle
-    x = 0.1 * np.sin(t)
-    y = 0.1 * np.cos(t)
-    z = 0.5 + 0.05 * np.sin(t * 0.5)
+    # Rotation changing over time
+    # Make rotations smoother and less extreme
+    rotation = Rotation.from_euler('xyz', [0.5 * np.sin(t * 0.2), 
+                                           0.5 * np.cos(t * 0.1), 
+                                           0.3 * np.sin(t * 0.15)]).as_matrix()
     
-    # Create a rotation that changes over time
-    rotation = Rotation.from_euler('xyz', [t * 0.2, t * 0.1, t * 0.15]).as_matrix()
-    
-    # Create the hand frame
     hand_frame = np.zeros((4, 3))
-    hand_frame[0] = [x, y, z]  # Translation
-    hand_frame[1:] = rotation  # Rotation
-    
+    hand_frame[0] = [x, y, z]  # Translation (relative to initial robot EE or a world frame)
+    hand_frame[1:] = rotation  # Rotation matrix R (orientation of hand in world/robot base)
+                               # Columns of R are X,Y,Z axes of hand frame, expressed in world frame.
     return hand_frame
 
 
-def generate_hand_keypoints(t):
-    """
-    Generate simulated hand keypoints for testing.
-    
-    Args:
-        t (float): Time parameter to create movement
-        
-    Returns:
-        np.ndarray: Array of hand keypoints
-    """
-    # Create a base hand pose
-    keypoints = np.zeros((21, 3))
-    
-    # Wrist position
+def generate_hand_keypoints(t, cycle_duration=6):
+    keypoints = np.zeros((21, 3)) # Base keypoints around origin
+    # ... (keypoint definitions from original script are fine) ...
+    # Wrist position (origin for other keypoints)
     keypoints[0] = [0, 0, 0]
-    
     # Thumb
-    keypoints[1] = [0.03, 0.01, 0]
-    keypoints[2] = [0.05, 0.02, 0]
-    keypoints[3] = [0.07, 0.03, 0]
-    keypoints[4] = [0.09, 0.04, 0]
+    keypoints[OCULUS_JOINTS['thumb'][0]] = [0.01, 0.005, 0]
+    keypoints[OCULUS_JOINTS['thumb'][1]] = [0.02, 0.01, 0]
+    keypoints[OCULUS_JOINTS['thumb'][2]] = [0.03, 0.015, 0]
+    keypoints[OCULUS_JOINTS['thumb'][3]] = [0.04, 0.02, 0] # Thumb tip
+    # Index
+    keypoints[OCULUS_JOINTS['index'][0]] = [0.005, 0.025, 0] 
+    # ... (fill in other keypoints if their precise location matters for gestures) ...
+    keypoints[OCULUS_JOINTS['index'][3]] = [0.02, 0.08, 0] # Index tip
+    # Middle
+    keypoints[OCULUS_JOINTS['middle'][0]] = [0, 0.03, 0]
+    keypoints[OCULUS_JOINTS['middle'][3]] = [0, 0.09, 0] # Middle tip
+    # Ring
+    keypoints[OCULUS_JOINTS['ring'][0]] = [-0.005, 0.025, 0]
+    keypoints[OCULUS_JOINTS['ring'][3]] = [-0.02, 0.08, 0] # Ring tip
+    # Pinky
+    keypoints[OCULUS_JOINTS['pinky'][0]] = [-0.01, 0.02, 0]
+    keypoints[OCULUS_JOINTS['pinky'][3]] = [-0.04, 0.06, 0] # Pinky tip
+
+    # Simulate pinching for gripper: Thumb tip to Pinky tip (distance < 0.03)
+    # Cycle: 0-2s open, 2-4s pinch, 4-6s open
+    time_in_gripper_cycle = t % (cycle_duration / 1.5) # 4s cycle for gripper
+    if time_in_gripper_cycle >= (cycle_duration / 3): # Pinch for 2s out of 4s
+        # Move thumb tip and pinky tip close together
+        keypoints[OCULUS_JOINTS['thumb'][3]] = [-0.01, 0.03, 0.005] 
+        keypoints[OCULUS_JOINTS['pinky'][3]] = [-0.01, 0.035, 0.005]
     
-    # Index finger
-    keypoints[5] = [0.02, 0.04, 0]
-    keypoints[6] = [0.03, 0.08, 0]
-    keypoints[7] = [0.04, 0.12, 0]
-    keypoints[8] = [0.05, 0.16, 0]
-    
-    # Middle finger
-    keypoints[9] = [0, 0.05, 0]
-    keypoints[10] = [0, 0.09, 0]
-    keypoints[11] = [0, 0.13, 0]
-    keypoints[12] = [0, 0.17, 0]
-    
-    # Ring finger
-    keypoints[13] = [-0.02, 0.04, 0]
-    keypoints[14] = [-0.03, 0.08, 0]
-    keypoints[15] = [-0.04, 0.12, 0]
-    keypoints[16] = [-0.05, 0.16, 0]
-    
-    # Pinky finger
-    keypoints[17] = [-0.04, 0.03, 0]
-    keypoints[18] = [-0.06, 0.06, 0]
-    keypoints[19] = [-0.08, 0.09, 0]
-    keypoints[20] = [-0.10, 0.12, 0]
-    
-    # Add some movement based on time
-    # Simulate pinching motion between thumb and pinky for gripper control
-    if int(t) % 4 >= 2:  # Every 2 seconds, alternate between pinch and open
-        # Pinch position
-        keypoints[4] = [-0.08, 0.08, 0]  # Move thumb tip closer to pinky
-        keypoints[20] = [-0.08, 0.08, 0]  # Move pinky tip closer to thumb
-    
-    # Simulate pinching motion between thumb and middle/ring for pause control
-    if int(t) % 6 >= 3:  # Every 3 seconds, alternate between pinch and open
-        # Pinch position
-        keypoints[4] = [0, 0.13, 0]  # Move thumb tip closer to middle finger
-        keypoints[12] = [0.04, 0.13, 0]  # Move middle finger tip closer to thumb
+    # Simulate pinching for pause: Thumb tip to Middle/Ring tip
+    # Cycle: 0-3s no pause pinch, 3-6s pause pinch
+    time_in_pause_cycle = t % cycle_duration # 6s cycle for pause
+    if time_in_pause_cycle >= (cycle_duration / 2): # Pinch for 3s out of 6s
+        # Move thumb tip and middle tip close
+        keypoints[OCULUS_JOINTS['thumb'][3]] = [0, 0.05, 0.005]
+        keypoints[OCULUS_JOINTS['middle'][3]] = [0.005, 0.055, 0.005]
     
     return keypoints
 
 
-def run_vr_simulation(host="localhost", duration=30, fps=30):
-    """
-    Run a VR simulation that publishes hand frames and keypoints.
-    
-    Args:
-        host (str): Host address
-        duration (int): Duration of the simulation in seconds
-        fps (int): Frames per second
-    """
+def run_vr_simulation(host="localhost", keypoint_port=8087, duration=30, fps=30):
+    pusher = None
     try:
-        # Create publishers with automatic port selection if default is in use
-        print(f"Initializing publishers on {host}...")
+        print(f"Initializing ZMQKeypointPusher to connect to {host}:{keypoint_port}...")
+        pusher = ZMQKeypointPusher(host, keypoint_port)
         
-        # We'll use a single pusher for all message types
-        keypoint_port = 8087  # Start with this port - correct port for the VR app
-        keypoint_pusher = ZMQKeypointPusher(host, keypoint_port)
-        actual_keypoint_port = keypoint_pusher.port
-        
-        print(f"Starting VR simulation on {host}")
-        print(f"Pushing data to port {actual_keypoint_port}")
-        print(f"Running for {duration} seconds at {fps} FPS")
-        print(f"NOTE: If you're running the VR teleoperation, make sure to update the port in your command:")
-        print(f"  --control.transformed_keypoint_port={actual_keypoint_port}")
+        print(f"Starting VR simulation pushing to {host}:{pusher.get_port()}") # get_port() returns configured port
+        print(f"Running for {duration} seconds at approximately {fps} FPS.")
+        print(f"Target server port for PULL socket is {keypoint_port}.")
+        print("Ensure the lerobot script's --control.transformed_keypoint_port matches this.")
     
-        # Run the simulation
         start_time = time.time()
         frame_count = 0
         
-        try:
-            while time.time() - start_time < duration:
-                t = time.time() - start_time
-                
-                # Generate and push hand frame
-                hand_frame = generate_hand_frame(t)
-                keypoint_pusher.push_keypoints(hand_frame, "transformed_hand_frame")
-                
-                # Generate and push hand keypoints
-                hand_keypoints = generate_hand_keypoints(t)
-                keypoint_pusher.push_keypoints(hand_keypoints, "transformed_hand_coords")
-                
-                # Push resolution button state (alternate between high and low resolution)
-                resolution = ARM_HIGH_RESOLUTION if int(t) % 8 >= 4 else ARM_LOW_RESOLUTION
-                keypoint_pusher.push_keypoints(np.array([resolution]), "button")
-                
-                # Send heartbeat if needed
-                keypoint_pusher.send_heartbeat()
-                
-                # Sleep to maintain FPS
-                frame_count += 1
-                elapsed = time.time() - start_time
-                target_elapsed = frame_count / fps
-                if elapsed < target_elapsed:
-                    time.sleep(target_elapsed - elapsed)
-                
-                # Print status every second
-                if int(elapsed) > int(elapsed - 0.1):
-                    print(f"Simulation running for {int(elapsed)}s, publishing at {frame_count / elapsed:.1f} FPS")
+        sim_active = True
+        while sim_active and (time.time() - start_time < duration):
+            loop_start_time = time.time()
+            t_sim = loop_start_time - start_time # Simulation time
+            
+            # Generate and push hand frame
+            hand_frame = generate_hand_frame(t_sim)
+            pusher.push_keypoints(hand_frame, "transformed_hand_frame")
+            
+            # Generate and push hand keypoints
+            hand_keypoints = generate_hand_keypoints(t_sim)
+            pusher.push_keypoints(hand_keypoints, "transformed_hand_coords")
+            
+            # Push resolution button state (alternate every 4s within an 8s cycle)
+            resolution = ARM_HIGH_RESOLUTION if (int(t_sim) % 8) < 4 else ARM_LOW_RESOLUTION
+            pusher.push_keypoints(np.array([resolution]), "button")
+            
+            pusher.send_heartbeat()
+            
+            frame_count += 1
+            
+            # Precise sleep to maintain FPS
+            elapsed_in_loop = time.time() - loop_start_time
+            sleep_time = (1.0 / fps) - elapsed_in_loop
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            
+            if frame_count % fps == 0: # Print status roughly every second
+                print(f"Sim running for {int(t_sim)}s. Frame {frame_count}. Actual FPS: {frame_count / t_sim if t_sim > 0 else fps:.1f}")
         
-        except KeyboardInterrupt:
-            print("Simulation interrupted by user")
-            # Send one final message to indicate clean shutdown
-            keypoint_pusher.push_keypoints(np.array([0]), "shutdown")
-            time.sleep(0.5)  # Give time for the message to be sent
-        
-        print(f"Simulation completed after {time.time() - start_time:.1f} seconds")
-        print(f"Published {frame_count} frames at an average of {frame_count / (time.time() - start_time):.1f} FPS")
-    
+    except KeyboardInterrupt:
+        print("\nSimulation interrupted by user.")
     except Exception as e:
-        print(f"Error in VR simulation: {e}")
+        print(f"Error in VR simulation: {e}", exc_info=True)
+    finally:
+        if pusher:
+            print("Sending shutdown signal...")
+            pusher.push_keypoints(np.array([0]), "shutdown") # Send shutdown signal
+            time.sleep(0.5) # Give time for message to be sent
+            pusher.close()
+        
+        total_time = time.time() - start_time
+        print(f"Simulation ended after {total_time:.1f} seconds.")
+        if total_time > 0 :
+             print(f"Published {frame_count} frames at an average of {frame_count / total_time:.1f} FPS.")
+        else:
+            print(f"Published {frame_count} frames.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VR Teleoperation Test")
-    parser.add_argument("--host", type=str, default="192.168.0.117", help="Host address")
-    parser.add_argument("--duration", type=int, default=1, help="Duration of the simulation in seconds")
-    parser.add_argument("--fps", type=int, default=30, help="Frames per second")
+    parser = argparse.ArgumentParser(description="VR Teleoperation Test Script")
+    parser.add_argument("--host", type=str, default="192.168.0.117", help="Host address of the robot control script")
+    parser.add_argument("--port", type=int, default=8087, help="Port number for ZMQ PUSH socket (must match robot script's PULL port)")
+    parser.add_argument("--duration", type=int, default=60, help="Duration of the simulation in seconds") # Increased default
+    parser.add_argument("--fps", type=int, default=30, help="Target frames per second for publishing data")
     
     args = parser.parse_args()
-    run_vr_simulation(args.host, args.duration, args.fps)
+    run_vr_simulation(args.host, args.port, args.duration, args.fps)

@@ -129,7 +129,7 @@ class VRTeleoperateControlConfig(ControlConfig):
     """Configuration for VR teleoperation control."""
     type: str = "teleoperate_vr"
     teleop_time_s: float | None = None  # None means unlimited
-    fps: int | None = None  # None means as fast as possible
+    fps: int = 30  # None means as fast as possible
     display_data: bool = True
     play_sounds: bool = True
     host_address: str = "0.0.0.0"  # Listen on all interfaces
