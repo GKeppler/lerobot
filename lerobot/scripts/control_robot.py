@@ -153,7 +153,9 @@ from lerobot.common.robot_devices.control_configs import (
     RemoteRobotConfig,
     ReplayControlConfig,
     TeleoperateControlConfig,
+    VRTeleoperateControlConfig,
 )
+from lerobot.common.robot_devices.vr_teleoperation import teleoperate_vr
 from lerobot.common.robot_devices.control_utils import (
     control_loop,
     init_keyboard_listener,
@@ -421,6 +423,9 @@ def control_robot(cfg: ControlPipelineConfig):
         record(robot, cfg.control)
     elif isinstance(cfg.control, ReplayControlConfig):
         replay(robot, cfg.control)
+    elif isinstance(cfg.control, VRTeleoperateControlConfig):
+        _init_rerun(control_config=cfg.control, session_name="lerobot_control_loop_vr_teleop")
+        teleoperate_vr(robot, cfg.control)
     elif isinstance(cfg.control, RemoteRobotConfig):
         from lerobot.common.robot_devices.robots.lekiwi_remote import run_lekiwi
 

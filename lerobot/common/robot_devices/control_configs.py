@@ -123,6 +123,29 @@ class RemoteRobotConfig(ControlConfig):
     viewer_port: str | None = None
 
 
+@ControlConfig.register_subclass("teleoperate_vr")
+@dataclass
+class VRTeleoperateControlConfig(ControlConfig):
+    """Configuration for VR teleoperation control."""
+    type: str = "teleoperate_vr"
+    teleop_time_s: float | None = None  # None means unlimited
+    fps: int | None = None  # None means as fast as possible
+    display_data: bool = True
+    play_sounds: bool = True
+    host_address: str = "0.0.0.0"  # Listen on all interfaces
+    host_ip: str = "localhost"  # Use "localhost" for local testing, set to your local IP (e.g., 192.168.0.117) for network access
+    oculus_port: int = 8087
+    keypoint_port: int = 8088
+    transformed_keypoint_port: int = 8087  # Correct port for the VR app
+    resolution_button_port: int = 8095
+    resolution_button_publish_port: int = 8093
+    teleop_reset_port: int = 8100
+    teleop_reset_publish_port: int = 8102
+    gripper_port: int = 8108
+    use_filter: bool = True
+    filter_ratio: float = 0.8
+
+
 @dataclass
 class ControlPipelineConfig:
     robot: RobotConfig
